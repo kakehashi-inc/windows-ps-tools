@@ -12,8 +12,9 @@ import shutil
 import tempfile
 import os
 import xml.etree.ElementTree as ET
+import datetime
 from pathlib import Path
-from typing import List, Dict, Tuple
+from typing import List, Dict, Tuple, Optional
 
 
 def run_command(cmd: List[str]) -> Tuple[str, str, int]:
@@ -48,8 +49,70 @@ def is_command_available(command: str) -> bool:
     return result
 
 
-def get_app_display_name(package_id: str) -> str:
-    """winget showで正確な表示名を取得"""
+def get_cache_dir(output_dir: Path) -> Path:
+    """キャッシュディレクトリを取得・作成"""
+    cache_dir = output_dir / "cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    return cache_dir
+
+
+def get_cache_file(cache_dir: Path) -> Path:
+    """キャッシュファイルのパスを取得"""
+    return cache_dir / "winget_cache.json"
+
+
+def load_all_cached_winget_info(cache_dir: Path) -> Dict[str, Dict]:
+    """全キャッシュデータを読み込み"""
+    cache_file = get_cache_file(cache_dir)
+
+    if not cache_file.exists():
+        return {}
+
+    try:
+        with open(cache_file, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        # キャッシュファイルが破損している場合は空の辞書を返す
+        return {}
+
+
+def load_cached_winget_info(cache_dir: Path, package_id: str) -> Optional[Dict]:
+    """キャッシュから特定のpackage_idの情報を読み込み"""
+    all_cache = load_all_cached_winget_info(cache_dir)
+    return all_cache.get(package_id)
+
+
+def save_winget_info_to_cache(cache_dir: Path, package_id: str, display_name: str):
+    """winget show情報をキャッシュに保存（軽量版）"""
+    cache_file = get_cache_file(cache_dir)
+
+    try:
+        # 既存のキャッシュデータを読み込み
+        all_cache = load_all_cached_winget_info(cache_dir)
+
+        # 新しい情報を追加（必要最小限のデータのみ）
+        all_cache[package_id] = {"package_id": package_id, "cached_at": datetime.datetime.now().isoformat(), "display_name": display_name}
+
+        # ファイルに書き戻し
+        with open(cache_file, "w", encoding="utf-8") as f:
+            json.dump(all_cache, f, ensure_ascii=False, indent=2)
+
+    except Exception as e:
+        print(f"    Warning: キャッシュの保存に失敗 {package_id}: {e}")
+
+
+def get_app_display_name(package_id: str, cache_dir: Optional[Path] = None) -> str:
+    """winget showで正確な表示名を取得（キャッシュ機能付き）"""
+
+    # キャッシュが有効な場合は、まずキャッシュから検索
+    if cache_dir:
+        cached_info = load_cached_winget_info(cache_dir, package_id)
+        if cached_info:
+            return cached_info.get("display_name", "")
+
+    # キャッシュにない場合はwinget showを実行
+    display_name = ""
+
     try:
         stdout, _, returncode = run_command(["winget", "show", package_id, "--disable-interactivity"])
 
@@ -58,132 +121,106 @@ def get_app_display_name(package_id: str) -> str:
             for line in stdout.split("\n"):
                 line = line.strip()
                 if f"[{package_id}]" in line:
-                    # "見つかりました AppName [PackageId]" の形式から AppName を取得
+                    # "見つかりました AppName [PackageId]" または "Found AppName [PackageId]" の形式から AppName を取得
                     before_bracket = line.split(f"[{package_id}]")[0].strip()
 
-                    # 日本語や特定の単語を除去
-                    import re
-
-                    cleaned = re.sub(r"[ぁ-んァ-ン一-龯]", "", before_bracket)
-                    cleaned = cleaned.replace("Found", "").strip()
-
-                    # 残った部分から表示名を取得
-                    if cleaned:
-                        parts = cleaned.split()
-                        if parts:
-                            # 複数語の場合は適切に結合
-                            if len(parts) >= 2:
-                                return " ".join(parts[-2:])
-                            else:
-                                return parts[-1]
+                    # 検索結果の接頭語のみを除去（日本語表示名は保持）
+                    if before_bracket.startswith("見つかりました "):
+                        display_name = before_bracket[len("見つかりました ") :].strip()
+                    elif before_bracket.startswith("Found "):
+                        display_name = before_bracket[len("Found ") :].strip()
+                    else:
+                        # その他の場合は全体を表示名として使用
+                        display_name = before_bracket.strip()
                     break
     except Exception:
+        # エラーが発生した場合はそのまま継続
         pass
 
-    # 取得に失敗した場合はPackageIDから推測
-    return package_id.split(".")[-1] if "." in package_id else package_id
+    # 表示名が取得できなかった場合はPackageIDから推測
+    if not display_name:
+        display_name = package_id.split(".")[-1] if "." in package_id else package_id
+
+    # キャッシュに保存（表示名のみ）
+    if cache_dir:
+        save_winget_info_to_cache(cache_dir, package_id, display_name)
+
+    return display_name
 
 
-def get_microsoft_store_apps() -> List[Dict[str, str]]:
+def get_winget_source_apps(source: str, source_name: str, cache_dir: Optional[Path] = None) -> List[Dict[str, str]]:
+    """指定されたwingetソースからアプリの情報を取得（winget exportを使用）"""
+    print(f"{source_name}アプリを処理中...")
+
+    apps = []
+
+    try:
+        # 一時ファイルを作成
+        temp_fd, temp_path = tempfile.mkstemp(suffix=".json", text=True)
+        os.close(temp_fd)
+
+        # winget export実行
+        _, _, returncode = run_command(["winget", "export", "-s", source, "-o", temp_path, "--disable-interactivity", "--include-versions"])
+
+        if returncode == 0 and os.path.exists(temp_path):
+            with open(temp_path, "r", encoding="utf-8") as f:
+                json_data = json.load(f)
+
+            packages = []
+            if "Sources" in json_data:
+                for source_data in json_data["Sources"]:
+                    if "Packages" in source_data:
+                        packages = source_data["Packages"]
+                        break
+
+            # キャッシュにないパッケージをリストアップ
+            packages_to_fetch = []
+            all_cache = load_all_cached_winget_info(cache_dir) if cache_dir else {}
+
+            for package in packages:
+                package_id = package.get("PackageIdentifier", "")
+                if package_id and package_id not in all_cache:
+                    packages_to_fetch.append(package_id)
+
+            fetch_count = len(packages_to_fetch)
+            if fetch_count > 0:
+                print(f"  → {fetch_count}個のパッケージでwinget showを実行中...")
+
+            fetch_index = 0
+            for package in packages:
+                package_id = package.get("PackageIdentifier", "")
+                version = package.get("Version", "latest")
+
+                if package_id:
+                    # キャッシュなしの場合のみ進捗表示
+                    if package_id in packages_to_fetch:
+                        fetch_index += 1
+                        print(f"    [{fetch_index}/{fetch_count}] {package_id}")
+
+                    # winget show で正確な表示名を取得（キャッシュ使用）
+                    name = get_app_display_name(package_id, cache_dir)
+
+                    apps.append({"PackageId": package_id, "Name": name, "Version": version})
+
+        # 一時ファイルを削除
+        if os.path.exists(temp_path):
+            os.unlink(temp_path)
+
+    except Exception as e:
+        print(f"  Warning: winget export failed for {source}: {e}")
+
+    print(f"  → {len(apps)}個のアプリを検出")
+    return apps
+
+
+def get_microsoft_store_apps(cache_dir: Optional[Path] = None) -> List[Dict[str, str]]:
     """Microsoft Store アプリの情報を取得（winget exportを使用）"""
-    print("Microsoft Storeアプリを処理中...")
-
-    apps = []
-
-    try:
-        # 一時ファイルを作成
-        temp_fd, temp_path = tempfile.mkstemp(suffix=".json", text=True)
-        os.close(temp_fd)
-
-        # winget export実行
-        _, _, returncode = run_command(["winget", "export", "-s", "msstore", "-o", temp_path, "--disable-interactivity", "--include-versions"])
-
-        if returncode == 0 and os.path.exists(temp_path):
-            with open(temp_path, "r", encoding="utf-8") as f:
-                json_data = json.load(f)
-
-            packages = []
-            if "Sources" in json_data:
-                for source_data in json_data["Sources"]:
-                    if "Packages" in source_data:
-                        packages = source_data["Packages"]
-                        break
-
-            total_count = len(packages)
-            print(f"  → {total_count}個のパッケージを検出、表示名を取得中...")
-
-            for i, package in enumerate(packages, 1):
-                package_id = package.get("PackageIdentifier", "")
-                version = package.get("Version", "latest")
-
-                if package_id:
-                    print(f"    [{i}/{total_count}] {package_id}")
-
-                    # winget show で正確な表示名を取得
-                    name = get_app_display_name(package_id)
-
-                    apps.append({"PackageId": package_id, "Name": name, "Version": version})
-
-        # 一時ファイルを削除
-        if os.path.exists(temp_path):
-            os.unlink(temp_path)
-
-    except Exception as e:
-        print(f"  Warning: winget export failed for msstore: {e}")
-
-    print(f"  → {len(apps)}個のアプリを検出")
-    return apps
+    return get_winget_source_apps("msstore", "Microsoft Store", cache_dir)
 
 
-def get_winget_apps() -> List[Dict[str, str]]:
+def get_winget_apps(cache_dir: Optional[Path] = None) -> List[Dict[str, str]]:
     """Winget アプリの情報を取得（winget exportを使用）"""
-    print("Wingetアプリを処理中...")
-
-    apps = []
-
-    try:
-        # 一時ファイルを作成
-        temp_fd, temp_path = tempfile.mkstemp(suffix=".json", text=True)
-        os.close(temp_fd)
-
-        # winget export実行
-        _, _, returncode = run_command(["winget", "export", "-s", "winget", "-o", temp_path, "--disable-interactivity", "--include-versions"])
-
-        if returncode == 0 and os.path.exists(temp_path):
-            with open(temp_path, "r", encoding="utf-8") as f:
-                json_data = json.load(f)
-
-            packages = []
-            if "Sources" in json_data:
-                for source_data in json_data["Sources"]:
-                    if "Packages" in source_data:
-                        packages = source_data["Packages"]
-                        break
-
-            total_count = len(packages)
-            print(f"  → {total_count}個のパッケージを検出、表示名を取得中...")
-
-            for i, package in enumerate(packages, 1):
-                package_id = package.get("PackageIdentifier", "")
-                version = package.get("Version", "latest")
-
-                if package_id:
-                    print(f"    [{i}/{total_count}] {package_id}")
-
-                    # winget show で正確な表示名を取得
-                    name = get_app_display_name(package_id)
-
-                    apps.append({"PackageId": package_id, "Name": name, "Version": version})
-
-        # 一時ファイルを削除
-        if os.path.exists(temp_path):
-            os.unlink(temp_path)
-
-    except Exception as e:
-        print(f"  Warning: winget export failed for winget: {e}")
-
-    print(f"  → {len(apps)}個のアプリを検出")
-    return apps
+    return get_winget_source_apps("winget", "Winget", cache_dir)
 
 
 def get_scoop_apps() -> List[Dict[str, str]]:
@@ -302,7 +339,11 @@ Chocolatey:
     output_dir = Path(args.output)
     output_dir.mkdir(exist_ok=True)
 
+    # キャッシュディレクトリの作成
+    cache_dir = get_cache_dir(output_dir)
+
     print(f"Output directory: {output_dir.absolute()}")
+    print(f"Cache directory: {cache_dir.absolute()}")
     print()
 
     # 各パッケージマネージャーの確認
@@ -319,7 +360,7 @@ Chocolatey:
 
     # Microsoft Store アプリ（wingetに依存）
     if winget_available:
-        ms_store_apps = get_microsoft_store_apps()
+        ms_store_apps = get_microsoft_store_apps(cache_dir)
         if ms_store_apps:
             write_csv(
                 output_dir / "microsoft_store_apps.csv",
@@ -329,7 +370,7 @@ Chocolatey:
 
     # Winget アプリ
     if winget_available:
-        winget_apps = get_winget_apps()
+        winget_apps = get_winget_apps(cache_dir)
         if winget_apps:
             write_csv(output_dir / "winget_apps.csv", winget_apps, ["PackageId", "Name", "Version"])
 
