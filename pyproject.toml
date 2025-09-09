@@ -1,0 +1,20 @@
+[tool.black]
+line-length = 160
+exclude = 'tests/'
+
+[tool.pylint.MASTER]
+load-plugins = ""
+
+[tool.pylint.FORMAT]
+max-line-length = 160
+
+[tool.pylint.DESIGN]
+max-args = 10
+max-locals = 25
+max-branches = 20
+max-statements = 60
+
+[tool.pylint.messages_control]
+disable = [
+    "W0718",
+]

@@ -1,0 +1,27 @@
+# 設定関連
+.env
+.env.*
+!.env.example
+
+# OSやエディタの一時ファイル
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+tmp/
+
+# ローカルデータ
+*.sqlite3
+*.sqlite3-journal
+*.db
+*.db-journal
+
+# 言語固有
+__pycache__/
+venv/
+
+# プロジェクト固有
+dist/
+build/
+static/
+staticfiles/
