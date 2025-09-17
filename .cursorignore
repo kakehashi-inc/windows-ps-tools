@@ -21,7 +21,3 @@ __pycache__/
 venv/
 
 # プロジェクト固有
-dist/
-build/
-static/
-staticfiles/
